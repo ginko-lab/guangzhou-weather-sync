@@ -29,7 +29,7 @@ import sys
 import argparse
 import urllib.request
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import libsql
 
@@ -289,19 +289,26 @@ def main():
     conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
     create_tables(conn)
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    SH_TZ = timezone(timedelta(hours=8))  # 数据为 Asia/Shanghai 时区，统一用上海时间
+    today = datetime.now(SH_TZ).strftime("%Y-%m-%d")
 
     if not args.skip_weather:
         if args.backfill:
             start, end = BACKFILL_START, today
             print(f"[天气] 全量回填 {start} ~ {end} ...")
         else:
-            start = (datetime.now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
+            start = (datetime.now(SH_TZ) - timedelta(days=args.days)).strftime("%Y-%m-%d")
             end = today
             print(f"[天气] 增量同步 {start} ~ {end} ...")
         rows = fetch_weather(start, end)
+        # 只保留已开始的小时，过滤掉 open-meteo 返回的当天未来时段
+        now_hour = datetime.now(SH_TZ).strftime("%Y-%m-%dT%H:00")
+        rows = [r for r in rows if r["time"] <= now_hour]
         upsert_weather(conn, rows)
-        print(f"[天气] 完成，写入/更新 {len(rows)} 条小时记录。")
+        # 清理数据库中已存在的未来小时记录，防止残留
+        conn.execute("DELETE FROM weather_hourly WHERE time > ?", [now_hour])
+        conn.commit()
+        print(f"[天气] 完成，写入/更新 {len(rows)} 条小时记录，已清理未来时段。")
 
     if not args.skip_air:
         if args.backfill_air:
