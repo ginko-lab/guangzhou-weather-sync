@@ -71,6 +71,22 @@ _AIR_SCALE = {
     "o3":   1.117,
 }
 
+# ---------------- WAQI 实时监测站（小时级） ----------------
+WAQI_TOKEN = os.environ.get("WAQI_TOKEN") or "f79fa00789127ed54c62a0fe82d39dd93d9db08b"
+WAQI_STATIONS = [
+    ("广州市监测站", 9845),
+    ("体育西",      8318),
+    ("广雅中学",    9844),
+    ("广州市五中",  9846),
+    ("海珠沙园",  14368),
+    ("花都师范",    9842),
+]
+# PM10 弃用 WAQI 值，改由 PM2.5 按历史回归重建（154 个月，R²=0.91）
+PM10_RECON_A = 1.287
+PM10_RECON_B = 10.87
+
+SH_TZ = timezone(timedelta(hours=8))  # 数据统一为 Asia/Shanghai
+
 
 # ---------------- 建表 ----------------
 def create_tables(conn):
@@ -95,6 +111,15 @@ def create_tables(conn):
             pm25 REAL, pm10 REAL, so2 REAL, no2 REAL, co REAL, o3 REAL,
             humidity REAL, pressure REAL, temperature REAL, wind REAL,
             dew REAL, wind_gust REAL, dominant_pollutant TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS air_hourly (
+            time TEXT PRIMARY KEY,
+            aqi INTEGER,
+            pm25 REAL, pm10 REAL, so2 REAL, no2 REAL, co REAL, o3 REAL,
+            dominant_pollutant TEXT,
+            station_count INTEGER
         )
     """)
     conn.commit()
@@ -158,6 +183,112 @@ def _china_aqi(pm25, pm10, so2, no2, co, o3):
         _iaqi_from_conc("o3", o3),
     ) if v is not None]
     return round(max(vals)) if vals else None
+
+
+def _aqi_detail(pm25, pm10, so2, no2, co, o3):
+    """返回 (国标AQI, 首要污染物)。"""
+    parts = {
+        "PM2.5": _iaqi_from_conc("pm25", pm25),
+        "PM10":  _iaqi_from_conc("pm10", pm10),
+        "SO2":   _iaqi_from_conc("so2", so2),
+        "NO2":   _iaqi_from_conc("no2", no2),
+        "CO":    _iaqi_from_conc("co", co),
+        "O3":    _iaqi_from_conc("o3", o3),
+    }
+    valid = {k: v for k, v in parts.items() if v is not None}
+    if not valid:
+        return None, None
+    dominant = max(valid, key=valid.get)
+    return round(max(valid.values())), dominant
+
+
+# ---------------- 拉取空气（WAQI 6 站实时 → 小时级） ----------------
+def _co_from_openmeteo():
+    """WAQI 的 CO 字段单位不可靠，改从 open-meteo 取当前 CO（μg/m³），按口径校正后转 mg/m³。"""
+    try:
+        url = (f"https://air-quality-api.open-meteo.com/v1/air-quality?"
+               f"latitude={WEATHER_LAT}&longitude={WEATHER_LON}"
+               f"&current=carbon_monoxide&timezone=Asia%2FShanghai&forecast_days=1")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        d = json.load(urllib.request.urlopen(req, timeout=30))
+        co_ug = (d.get("current") or {}).get("carbon_monoxide")
+        if co_ug is None:
+            return None
+        return co_ug * _AIR_SCALE["co"] / 1000.0  # → mg/m³，与日均口径一致
+    except Exception as e:
+        print(f"    [CO] open-meteo 拉取失败: {e}")
+        return None
+
+
+def fetch_air_waqi():
+    """等权聚合 6 个监测站实时浓度；PM10 由 PM2.5 回归重建，CO 取 open-meteo，返回单条小时记录。"""
+    acc = {"pm25": [], "so2": [], "no2": [], "o3": []}
+    n_ok = 0
+    for name, sid in WAQI_STATIONS:
+        url = f"https://api.waqi.info/feed/@{sid}/?token={WAQI_TOKEN}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            d = json.load(urllib.request.urlopen(req, timeout=20))
+        except Exception as e:
+            print(f"    [{name}] 拉取失败: {e}")
+            continue
+        if d.get("status") != "ok":
+            print(f"    [{name}] status={d.get('status')} {str(d.get('data'))[:80]}")
+            continue
+        ia = (d.get("data") or {}).get("iaqi", {})
+
+        def gv(k):
+            try:
+                v = ia.get(k, {}).get("v")
+                return float(v) if v not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+
+        pm25 = gv("pm25")
+        so2 = gv("so2")
+        no2 = gv("no2")
+        o3 = gv("o3")
+        if pm25 is None:
+            print(f"    [{name}] 无 PM2.5，跳过")
+            continue
+        n_ok += 1
+        acc["pm25"].append(pm25)
+        if so2 is not None:
+            acc["so2"].append(so2)
+        if no2 is not None:
+            acc["no2"].append(no2)
+        if o3 is not None:
+            acc["o3"].append(o3)
+
+    if n_ok == 0:
+        print("[WAQI] 无可用站点数据，跳过小时写入。")
+        return None
+
+    def mean(lst):
+        return sum(lst) / len(lst) if lst else None
+
+    pm25 = mean(acc["pm25"])
+    pm10 = (PM10_RECON_A * pm25 + PM10_RECON_B) if pm25 is not None else None
+    so2 = mean(acc["so2"])
+    no2 = mean(acc["no2"])
+    co = _co_from_openmeteo()
+    o3 = mean(acc["o3"])
+    aqi, dominant = _aqi_detail(pm25, pm10, so2, no2, co, o3)
+    now = datetime.now(SH_TZ).strftime("%Y-%m-%dT%H:00:00")
+    print(f"    [WAQI] 站数={n_ok} PM2.5={pm25} PM10重建={pm10} "
+          f"SO2={so2} NO2={no2} CO={co} O3={o3} 国标AQI={aqi} 首要={dominant}")
+    return {
+        "time": now,
+        "aqi": aqi,
+        "pm25": round(pm25, 1) if pm25 is not None else None,
+        "pm10": round(pm10, 1) if pm10 is not None else None,
+        "so2": round(so2, 1) if so2 is not None else None,
+        "no2": round(no2, 1) if no2 is not None else None,
+        "co": round(co, 3) if co is not None else None,
+        "o3": round(o3, 1) if o3 is not None else None,
+        "dominant_pollutant": dominant,
+        "station_count": n_ok,
+    }
 
 
 # ---------------- 拉取空气（open-meteo 小时级 → 日均） ----------------
@@ -275,6 +406,25 @@ def upsert_air_rows(conn, rows):
     return len(rows)
 
 
+def upsert_air_hourly_rows(conn, rows):
+    if not rows:
+        return 0
+    cols = ["time", "aqi", "pm25", "pm10", "so2", "no2", "co", "o3",
+            "dominant_pollutant", "station_count"]
+    col_sql = ", ".join(cols)
+    update_sql = ", ".join(f"{c}=excluded.{c}" for c in cols[1:])
+    row_ph = "(" + ", ".join(["?"] * len(cols)) + ")"
+    for i in range(0, len(rows), 100):
+        batch = rows[i:i + 100]
+        ph = ", ".join(row_ph for _ in batch)
+        sql = (f"INSERT INTO air_hourly ({col_sql}) VALUES {ph} "
+               f"ON CONFLICT(time) DO UPDATE SET {update_sql}")
+        params = [r[c] for r in batch for c in cols]
+        conn.execute(sql, params)
+    conn.commit()
+    return len(rows)
+
+
 # ---------------- 主流程 ----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -284,6 +434,7 @@ def main():
                     help="空气指定区间回填(日均), 如 --backfill-air 2026-07-07 2026-09-01")
     ap.add_argument("--skip-weather", action="store_true")
     ap.add_argument("--skip-air", action="store_true")
+    ap.add_argument("--skip-waqi", action="store_true", help="跳过 WAQI 小时级空气")
     args = ap.parse_args()
 
     conn = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
@@ -315,18 +466,28 @@ def main():
             start, end = args.backfill_air
             print(f"[空气] 回填日均 {start} ~ {end} ...")
         else:
-            start = (datetime.now() - timedelta(days=AIR_DAILY_LOOKBACK)).strftime("%Y-%m-%d")
+            start = (datetime.now(SH_TZ) - timedelta(days=AIR_DAILY_LOOKBACK)).strftime("%Y-%m-%d")
             end = today
             print(f"[空气] 增量同步日均 {start} ~ {end} ...")
         rows = fetch_air_openmeteo(start, end)
         n = upsert_air_rows(conn, rows)
         print(f"[空气] 完成，写入/更新 {n} 天日均值。")
 
+    if not args.skip_waqi:
+        print("[WAQI] 拉取 6 站实时浓度 ...")
+        h_row = fetch_air_waqi()
+        if h_row is not None:
+            upsert_air_hourly_rows(conn, [h_row])
+            print(f"[WAQI] 完成，写入小时记录 {h_row['time']} AQI={h_row['aqi']}。")
+
     # 汇总
     wc = conn.execute("SELECT COUNT(*) FROM weather_hourly").fetchall()[0][0]
     ac = conn.execute("SELECT COUNT(*) FROM air_quality").fetchall()[0][0]
     ar = conn.execute("SELECT MIN(time), MAX(time) FROM air_quality").fetchall()[0]
-    print(f"\n[汇总] weather_hourly={wc} 行, air_quality={ac} 行 ({ar[0]} ~ {ar[1]})")
+    hc = conn.execute("SELECT COUNT(*) FROM air_hourly").fetchall()[0][0]
+    hr = conn.execute("SELECT MIN(time), MAX(time) FROM air_hourly").fetchall()[0]
+    print(f"\n[汇总] weather_hourly={wc} 行, air_quality={ac} 行 ({ar[0]} ~ {ar[1]}), "
+          f"air_hourly={hc} 行 ({hr[0]} ~ {hr[1]})")
 
 
 if __name__ == "__main__":
